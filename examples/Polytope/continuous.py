@@ -1,0 +1,161 @@
+from rbf_polytope.identification import train_rbf_network
+from rbf_polytope import RbfData
+from rbf_polytope.utils import gaussian_rbf
+from rbf_polytope.identification.widths import ConstantWidthMethod, GradientWidthMethod
+from rbf_polytope.identification.vertices import LeastSquaresVerticesMethod, InfiniteNormMinimizationVerticesMethod, StableInfiniteNormMinimizationVerticesMethod
+from rbf_polytope.model import predict, continuous_simulation as simulate
+
+from argparse import ArgumentParser
+import numpy as np
+from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
+
+np.random.seed(1)
+
+parser = ArgumentParser()
+parser.add_argument('--stable', '-s', action='store_true', default=False)
+parser.add_argument('--constant', '-c', action='store_true', default=False)
+args = parser.parse_args()
+
+######################################################################
+# Generate Polytopic Model
+######################################################################
+
+C = np.ones((1, 2))
+L_train, L_test = 50, 50
+
+centers = np.array([[0], [1], [-1]])
+N = centers.shape[0]
+widths  = 5 * np.random.random((N,))
+vertices = np.array([ [-5, 0.0, -0.01, 0.0, -5, 0.0],
+                      [0.0, -0.01, 0.0, -5, 0.0, -0.01]])
+theta = np.pi / 4.5
+T = np.array([[np.cos(theta), np.sin(theta)],
+              [-np.sin(theta),  np.cos(theta)]])
+print("T:\n", T)
+vertices = T @ vertices @ np.block([[T.T, np.zeros_like(T), np.zeros_like(T)], [np.zeros_like(T), T.T, np.zeros_like(T)], [np.zeros_like(T), np.zeros_like(T), T.T]])
+
+nx, ny = vertices.shape[0], C.shape[0]
+
+print('System')
+print("Centers:\n", centers)
+print("widths:", widths.flatten())
+print("vertices:\n", vertices)
+
+x_train, x_test = np.array([[1], [-1]]), np.array([[-1], [1]])
+x0_train, x0_test = x_train.copy(), x_test.copy()
+print("x0 train:", x0_train.flatten())
+print("x0 test:", x0_test.flatten())
+
+def polytopic_model(t, x, vertices, centers, widths, C):
+    y = C @ x.reshape(-1, 1)
+    weights = gaussian_rbf(y, centers, widths)
+    phi = np.kron(weights.reshape(-1, 1), x.reshape(-1, 1))
+    dx = vertices @ phi
+    return dx.flatten()
+
+t_span = (0, 10)
+t_eval = np.linspace(t_span[0], t_span[1], 101)
+sol_train = solve_ivp(polytopic_model, t_span, x0_train.flatten(), t_eval=t_eval, args=(vertices, centers, widths, C))
+sol_test = solve_ivp(polytopic_model, t_span, x0_test.flatten(), t_eval=t_eval, args=(vertices, centers, widths, C))
+X_train, X_test = sol_train.y.T, sol_test.y.T
+dX_train = np.array([polytopic_model(t, x, vertices, centers, widths, C) for t, x in zip(sol_train.t, X_train)])
+dX_test = np.array([polytopic_model(t, x, vertices, centers, widths, C) for t, x in zip(sol_test.t, X_test)])
+
+Y_train = (C @ X_train.T).T
+Y_test = (C @ X_test.T).T
+
+######################################################################
+# LINEAR MODEL
+######################################################################
+state_matrix = dX_train.T @ np.linalg.pinv(X_train.T)
+dX_pred_train_linear = (state_matrix @ X_train.T).T
+dX_pred_test_linear = (state_matrix @ (X_test.T)).T
+
+def linear_model(t, x, state_matrix):
+    return (state_matrix @ x.reshape(-1, 1)).flatten()
+
+X_int_train_linear = solve_ivp(linear_model, t_span, x0_train.flatten(), t_eval=t_eval, args=(state_matrix,)).y.T
+X_int_test_linear = solve_ivp(linear_model, t_span, x0_test.flatten(), t_eval=t_eval, args=(state_matrix,)).y.T
+
+######################################################################
+# TRAINING RBF MODEL
+######################################################################
+first_rbf = RbfData(radius=widths[0], center=np.zeros((1, ny)))
+
+model = train_rbf_network(
+    states = X_train,
+    outputs = dX_train,
+    schedulParams = Y_train,
+    max_rbf_count = N,
+    error_threshold = 1e-3,
+    first_rbf = first_rbf,
+    width_method=GradientWidthMethod(bounds=(1e-2, 10), method='L-BFGS-B'),
+    vertices_method=InfiniteNormMinimizationVerticesMethod(),
+    is_continous=True
+)
+
+print('Model')
+print("Centers:\n", model.centers)
+print("widths:", model.widths.flatten())
+
+######################################################################
+# SIMULATE RBF MODEL
+######################################################################
+
+dX_pred_train = predict(model, X_train, Y_train)
+dX_pred_test = predict(model, X_test, Y_test)
+
+X_int_train = simulate(model, x0_train, C, t_span=t_span, t_eval=sol_train.t)
+X_int_test = simulate(model, x0_test, C, t_span=t_span, t_eval=sol_test.t)
+
+######################################################################
+# Compare MODEL
+######################################################################
+print("Results:")
+print("Training maximum error:")
+print("\t Prediction")
+print("\t\t RBF error:", np.max(np.linalg.norm(dX_train - dX_pred_train, axis=1)))
+print("\t\t Linear error:", np.max(np.linalg.norm(dX_train - dX_pred_train_linear, axis=1)))
+print("\t Integration")
+print("\t\t RBF error:", np.max(np.linalg.norm(X_train - X_int_train, axis=1)))
+print("\t\t Linear error:", np.max(np.linalg.norm(X_train - X_int_train_linear, axis=1)))
+print("Testing maximum error:")
+print("\t Prediction")
+print("\t\t RBF error:", np.max(np.linalg.norm(dX_test - dX_pred_test, axis=1)))
+print("\t\t Linear error:", np.max(np.linalg.norm(dX_test - dX_pred_test_linear, axis=1)))
+print("\t Integration")
+print("\t\t RBF error:", np.max(np.linalg.norm(X_test - X_int_test, axis=1)))
+print("\t\t Linear error:", np.max(np.linalg.norm(X_test - X_int_test_linear, axis=1)))
+
+fig, axes = plt.subplots(nx, 2)
+for i in range(nx):
+    axes[i, 0].plot(dX_train[:, i], '-r', label="System")
+    axes[i, 0].plot(dX_pred_train[:, i], '--b', label="Model")
+    axes[i, 0].plot(dX_pred_train_linear[:, i], '-.g', label="Linear")
+    axes[i, 0].set_ylabel(f'$x_{i}$')
+    axes[i, 1].plot(dX_test[:, i], '-r', label="System")
+    axes[i, 1].plot(dX_pred_test[:, i], '--b', label="Model")
+    axes[i, 1].plot(dX_pred_test_linear[:, i], '-.g', label="Linear")
+axes[0, 0].legend()
+axes[0, 0].set_title("Training")
+axes[0, 1].set_title("Testing")
+fig.suptitle("Prediction")
+plt.tight_layout()
+
+fig, axes = plt.subplots(nx, 2)
+for i in range(nx):
+    axes[i, 0].plot(X_train[:, i], '-r', label="System")
+    axes[i, 0].plot(X_int_train[:, i], '--b', label="Model")
+    axes[i, 0].plot(X_int_train_linear[:, i], '-.g', label="Linear")
+    axes[i, 0].set_ylabel(f'$x_{i}$')
+    axes[i, 1].plot(X_test[:, i], '-r', label="System")
+    axes[i, 1].plot(X_int_test[:, i], '--b', label="Model")
+    axes[i, 1].plot(X_int_test_linear[:, i], '-.g', label="Linear")
+axes[0, 0].legend()
+axes[0, 0].set_title("Training")
+axes[0, 1].set_title("Testing")
+fig.suptitle("Integration")
+plt.tight_layout()
+
+plt.show()
